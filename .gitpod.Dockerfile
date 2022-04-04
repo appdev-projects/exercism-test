@@ -62,20 +62,69 @@ RUN curl -sSL https://rvm.io/mpapis.asc | gpg --import - \
     && curl -fsSL https://get.rvm.io | bash -s stable \
     && bash -lc " \
         rvm requirements \
-        && rvm install 2.7.2 \
-        && rvm use 2.7.2 --default \
+        && rvm install 3.0.0 \
+        && rvm use 3.0.0 --default \
         && rvm rubygems current \
-        && gem install bundler --no-document \
-        && gem install solargraph --no-document" \
+        && gem install bundler --no-document" \
     && echo '[[ -s "$HOME/.rvm/scripts/rvm" ]] && source "$HOME/.rvm/scripts/rvm" # Load RVM into a shell session *as a function*' >> /home/gitpod/.bashrc.d/70-ruby
 RUN echo "rvm_gems_path=/home/gitpod/.rvm" > ~/.rvmrc
 
 USER gitpod
 # AppDev stuff
-RUN /bin/bash -l -c "gem install rufo"
+RUN /bin/bash -l -c "gem install htmlbeautifier rufo -N"
 
-# Install heroku-cli
-RUN /bin/bash -l -c "curl https://cli-assets.heroku.com/install.sh | sh"
+# Install Google Chrome
+RUN sudo sh -c 'echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" | \
+    tee -a /etc/apt/sources.list.d/google.list' && \
+    wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | \
+    sudo apt-key add - && \
+    sudo apt-get update && \
+    sudo apt-get install -y google-chrome-stable libxss1
+
+# Install Chromedriver (compatable with Google Chrome version)
+#   See https://gerg.dev/2021/06/making-chromedriver-and-chrome-versions-match-in-a-docker-image/
+RUN BROWSER_MAJOR=$(google-chrome --version | sed 's/Google Chrome \([0-9]*\).*/\1/g') && \
+    wget https://chromedriver.storage.googleapis.com/LATEST_RELEASE_${BROWSER_MAJOR} -O chrome_version && \
+    wget https://chromedriver.storage.googleapis.com/`cat chrome_version`/chromedriver_linux64.zip && \
+    unzip chromedriver_linux64.zip && \
+    sudo mv chromedriver /usr/local/bin/ && \
+    DRIVER_MAJOR=$(chromedriver --version | sed 's/ChromeDriver \([0-9]*\).*/\1/g') && \
+    echo "chrome version: $BROWSER_MAJOR" && \
+    echo "chromedriver version: $DRIVER_MAJOR" && \
+    if [ $BROWSER_MAJOR != $DRIVER_MAJOR ]; then echo "VERSION MISMATCH"; exit 1; fi
+
+# Install PostgreSQL
+RUN sudo install-packages postgresql-12 postgresql-contrib-12
+
+# Setup PostgreSQL server for user gitpod
+ENV PATH="$PATH:/usr/lib/postgresql/12/bin"
+ENV PGDATA="/workspace/.pgsql/data"
+RUN mkdir -p ~/.pg_ctl/bin ~/.pg_ctl/sockets \
+ && printf '#!/bin/bash\n[ ! -d $PGDATA ] && mkdir -p $PGDATA && initdb -D $PGDATA\npg_ctl -D $PGDATA -l ~/.pg_ctl/log -o "-k ~/.pg_ctl/sockets" start\n' > ~/.pg_ctl/bin/pg_start \
+ && printf '#!/bin/bash\npg_ctl -D $PGDATA -l ~/.pg_ctl/log -o "-k ~/.pg_ctl/sockets" stop\n' > ~/.pg_ctl/bin/pg_stop \
+ && chmod +x ~/.pg_ctl/bin/*
+ENV PATH="$PATH:$HOME/.pg_ctl/bin"
+ENV DATABASE_URL="postgresql://gitpod@localhost"
+ENV PGHOSTADDR="127.0.0.1"
+ENV PGDATABASE="postgres"
+
+# This is a bit of a hack. At the moment we have no means of starting background
+# tasks from a Dockerfile. This workaround checks, on each bashrc eval, if the
+# PostgreSQL server is running, and if not starts it.
+RUN printf "\n# Auto-start PostgreSQL server.\n[[ \$(pg_ctl status | grep PID) ]] || pg_start > /dev/null\n" >> ~/.bashrc
+
+WORKDIR /base-rails
+USER gitpod
+RUN /bin/bash -l -c "sudo apt update && sudo apt install -y graphviz"
+
+WORKDIR /base-rails
+COPY Gemfile /base-rails/Gemfile
+COPY Gemfile.lock /base-rails/Gemfile.lock
+# For some reason, the copied files were owned by root so bundle could not succeed
+RUN /bin/bash -l -c "sudo chown -R $(whoami):$(whoami) Gemfile Gemfile.lock"
+RUN /bin/bash -l -c "gem install bundler:2.2.16"
+
+RUN /bin/bash -l -c "bundle install"
 
 # Install Node and npm
 RUN curl -fsSL https://deb.nodesource.com/setup_15.x | sudo -E bash - \
@@ -84,10 +133,56 @@ RUN curl -fsSL https://deb.nodesource.com/setup_15.x | sudo -E bash - \
 # Install Yarn
 RUN curl -sS https://dl.yarnpkg.com/debian/pubkey.gpg | sudo apt-key add - \
     && echo "deb https://dl.yarnpkg.com/debian/ stable main" | sudo tee /etc/apt/sources.list.d/yarn.list \
+    && sudo apt-get update \
     && sudo apt-get install -y yarn
 
 # Install fuser
 RUN sudo apt install -y libpq-dev psmisc lsof
+
+# Install parity gem
+RUN wget -qO - https://apt.thoughtbot.com/thoughtbot.gpg.key | sudo apt-key add - \
+    && echo "deb http://apt.thoughtbot.com/debian/ stable main" | sudo tee /etc/apt/sources.list.d/thoughtbot.list \
+    && sudo apt-get update \
+    && sudo apt-get -y install parity
+
+# Install heroku-cli
+RUN /bin/bash -l -c "curl https://cli-assets.heroku.com/install.sh | sh"
+
+# Git global configuration
+RUN git config --global push.default upstream \
+    && git config --global merge.ff only \
+    && git config --global alias.acm '!f(){ git add -A && git commit -am "${*}"; };f' \
+    && git config --global alias.as '!git add -A && git stash' \
+    && git config --global alias.p 'push' \
+    && git config --global alias.sla 'log --oneline --decorate --graph --all' \
+    && git config --global alias.co 'checkout' \
+    && git config --global alias.cob 'checkout -b'
+
+# Alias 'git' to 'g'
+RUN echo 'export PATH="$PATH:$GITPOD_REPO_ROOT/bin"' >> ~/.bashrc
+RUN echo "# No arguments: 'git status'\n\
+# With arguments: acts like 'git'\n\
+g() {\n\
+  if [[ \$# > 0 ]]; then\n\
+    git \$@\n\
+  else\n\
+    git status\n\
+  fi\n\
+}\n# Complete g like git\n\
+source /usr/share/bash-completion/completions/git\n\
+__git_complete g __git_main" >> ~/.bash_aliases
+
+# Add current git branch to bash prompt
+RUN echo "# Add current git branch to prompt\n\
+parse_git_branch() {\n\
+    git branch 2> /dev/null | sed -e '/^[^*]/d' -e 's/* \\\(.*\\\)/:(\\\1)/'\n\
+}\n\
+\n\
+PS1='\[]0;\u \w\]\[[01;32m\]\u\[[00m\] \[[01;34m\]\w\[[00m\]\[\e[0;38;5;197m\]\$(parse_git_branch)\[\e[0m\] \\\$ '" >> ~/.bashrc
+
+# Hack to pre-install bundled gems
+RUN echo "rvm use 3.0.0" >> ~/.bashrc
+RUN echo "rvm_silence_path_mismatch_check_flag=1" >> ~/.rvmrc
 
 # Install exercism-cli
 WORKDIR /base-exercism
@@ -98,20 +193,6 @@ RUN sudo curl -L https://github.com/exercism/cli/releases/download/v3.0.13/exerc
     && sudo apt-get clean \
     && sudo rm -rf /var/lib/apt/lists/*
 
-# Alias 'git' to 'g'
-RUN echo 'export PATH="$PATH:$GITPOD_REPO_ROOT/bin"' >> ~/.bashrc
-RUN echo " # No arguments: 'git status'\n\
-# With arguments: acts like 'git'\n\
-g() {\n\
-  if [[ \$# > 0 ]]; then\n\
-    git \$@\n\
-  else\n\
-    git status\n\
-  fi\n\
-}\n\
-# Complete g like git\n\
-source /usr/share/bash-completion/completions/git\n\
-__git_complete g __git_main" >> ~/.bash_aliases
 
 # Install web_git
 RUN /bin/bash -l -c "gem install activesupport minitest rack specific_install"
